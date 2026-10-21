@@ -140,6 +140,50 @@ This makes it safe to drive from a loop: stop on the first non-zero code.
 `./php2shell-patch.sh <host|ip> --rollback` deletes only the `zz-php2shell.ini` files
 this script wrote and reloads the services.
 
+## F5 BIG-IP iRule (optional extra layer)
+
+`f5/php2shell_guard.irule.tcl` is an iRule that applies PHP's own proxy-level limits on a
+BIG-IP LTM virtual server in front of PHP sites. **It is virtual patching, not a fix** (the
+real fix is updating PHP). It caps multipart body size, the number of multipart parts and
+field-name nesting, blocks the `PHP_SESSION_UPLOAD_PROGRESS` field, and rejects excessive or
+oversized headers and requests with both `Transfer-Encoding` and `Content-Length`.
+It only covers traffic that passes through the virtual server it is attached to.
+
+It ships in **log-only mode** (`static::p2s_enforce 0`). Suggested use: install it, attach it
+to **one** low-risk HTTP virtual server, watch `/var/log/ltm` (`grep php2shell_guard`) and TMM
+CPU for 30-60 minutes, add sites that legitimately send big uploads to the
+`p2s_big_upload_hosts` data group, then widen and finally set `static::p2s_enforce 1`.
+
+Things to check during the log-only phase:
+
+* A multipart POST **without a `Content-Length`** (possible over HTTP/2 or with unusual
+  clients) is reported as `bad-or-huge-content-length` and would be blocked when enforcing.
+* Chunked multipart is allowed by default and is **buffered in memory** up to the size cap
+  (32 MiB, 256 MiB for listed hosts) per request. `static::p2s_block_chunked 1` rejects it
+  instead; browsers do not send chunked multipart.
+* The nesting check runs a regex over up to 4 MiB of body; watch CPU.
+* In log-only mode a scanner burst writes one log line per hit.
+
+### Deploying it: `f5/deploy-php2shell-guard.sh`
+
+An ssh + `tmsh` helper that makes the rollout safe and reversible:
+
+```bash
+f5/deploy-php2shell-guard.sh <f5-mgmt-host> status | list-vs                  # read-only
+f5/deploy-php2shell-guard.sh <f5-mgmt-host> install --block-chunked --yes     # UCS backup, data group, rule in log-only mode; attaches to nothing
+f5/deploy-php2shell-guard.sh <f5-mgmt-host> attach <virtual-server> --yes     # one HTTP virtual server at a time
+f5/deploy-php2shell-guard.sh <f5-mgmt-host> logs | detach <vs> --yes | enforce --yes | uninstall --yes
+```
+
+Every changing action only **prints its plan** unless you pass `--yes`. It refuses to run
+on a standby unit or to attach to a virtual server without an HTTP profile (override with
+`--force`), validates the rule with `tmsh ... verify` before loading it, never fails over,
+and saves the config (replicated if config-sync is on). The connection defaults to
+`ssh root@host`; set `F5_USER` and `F5_SSH` (for example a `sshpass -e ssh ...` command for
+keyboard-interactive password login) to change that. See the header of the script.
+
+Test on a non-production or low-risk virtual server first. Provided as-is.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
