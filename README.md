@@ -60,6 +60,25 @@ Remi / SCL, LiteSpeed `lsphp`, and generic source builds. If a PHP binary points
 at a configuration scan directory that does not exist yet (PHP silently ignores a
 missing one), the script creates it, but only under a known PHP prefix.
 
+### cPanel's own bundled PHP
+
+cPanel ships its own PHP (`/usr/local/cpanel/3rdparty/php/NN`) for its web apps
+(phpMyAdmin, Roundcube, ...). It is separate from the `ea-php` versions and has **no scan
+directory**, so a drop-in cannot reach it; its `php.ini` is the only config, and cPanel
+marks that file "DO NOT EDIT". On cPanel hosts the script therefore:
+
+1. backs the file up (`php.ini.bak-php2shell-<timestamp>`),
+2. adds three marked lines under `[Session]`,
+3. validates it (the bundled PHP must start cleanly and `php-fpm -t` must pass) and
+   **restores the backup automatically if not**,
+4. runs cPanel's own `/usr/local/cpanel/bin/install_php_inis`,
+5. gracefully reloads `cpanel_php_fpm` (`USR2`) and waits for it to come back.
+
+`--rollback` removes those three lines again. **cPanel may regenerate that file on an
+update**, silently dropping the edit; the script is idempotent, so just re-run it after
+cPanel updates (a `--dry-run` shows `WOULD EDIT` if the edit is gone). A cPanel update that
+ships a fixed bundled PHP makes this moot.
+
 ## Reading the output
 
 | Line | Meaning |
@@ -72,6 +91,7 @@ missing one), the script creates it, but only under a known PHP prefix.
 | `WARN-no-strict-mode-before-5.5.2` | That PHP is too old to have the setting. |
 | `HEALTH OK` / `HEALTH PROBLEM:...` | Service set, PHP-FPM master count and HTTP status before vs after. |
 | `lsphp workers marked for restart` | LiteSpeed was asked to recycle its `lsphp` workers. |
+| `edited cPanel bundled php.ini ...` / `already applied (cPanel bundled PHP)` | The cPanel-bundled-PHP edit was made / is already there. |
 | `NOTE extra scan dir ...` | A PHP binary reads a scan directory outside the built-in list; it was included. |
 | `NO_PHP_INI_DIR_FOUND` | No PHP scan directory found; nothing was changed. |
 

@@ -52,6 +52,12 @@
 #   If a PHP binary's configured scan dir does not exist yet (PHP silently
 #   ignores it), the script creates it — but only under a known PHP prefix.
 #
+# cPanel's own bundled PHP (/usr/local/cpanel/3rdparty/php/NN) has no scan dir, so
+# on cPanel hosts the script instead adds three marked lines under [Session] of its
+# php.ini (backup first, validated, restored on failure), runs cPanel's
+# install_php_inis and gracefully reloads cpanel_php_fpm. cPanel may regenerate that
+# file on update: re-run the script afterwards (it is idempotent).
+#
 # LIMITATIONS — read before use
 #   * Needs PHP >= 5.4 for upload_progress and >= 5.5.2 for strict mode. Older
 #     builds are flagged in the output; this script cannot protect them.
@@ -171,8 +177,66 @@ for d in $DIRS; do
     if [ "$DRY" = 1 ]; then echo "WOULD WRITE $f$miss"; else { [ -d "$d" ] || { mkdir -p "$d" && chmod 755 "$d"; }; } && printf '%s\n' "$INI" > "$f" && chmod 644 "$f" && echo "wrote $f$miss"; fi
   fi
 done
+# --- cPanel's own bundled PHP ("CpPHP", /usr/local/cpanel/3rdparty/php/NN) ----------
+# It runs cPanel's own web apps (phpMyAdmin, Roundcube, ...). Its php.ini is its ONLY
+# config (no scan dir), and cPanel marks it "DO NOT EDIT": updates may regenerate it.
+# So we add three marked lines under [Session], validate, run cPanel's own
+# install_php_inis, and reload cpanel_php_fpm. Re-run this script after cPanel updates.
+CP_MARK='; php2shell interim mitigation 2026-10-21 (CVE-2026-109618/109619) - re-apply if cPanel regenerates this file'
+CP_TODO=""
+for f in /usr/local/cpanel/3rdparty/php/[0-9]*/etc/php.ini; do
+  [ -f "$f" ] || continue
+  if [ "$ROLLBACK" = 1 ]; then
+    grep -q '^; php2shell interim mitigation' "$f" || continue
+    if [ "$DRY" = 1 ]; then echo "WOULD REVERT cPanel bundled php.ini $f"; else CP_TODO="$CP_TODO $f"; fi
+  else
+    if grep -q '^; php2shell interim mitigation' "$f" && [ "${FORCE:-0}" = 0 ]; then echo "already applied (cPanel bundled PHP) $f"; continue; fi
+    ALREADY_ALL=0
+    if [ "$DRY" = 1 ]; then echo "WOULD EDIT cPanel bundled php.ini $f (backup + install_php_inis)"; else CP_TODO="$CP_TODO $f"; fi
+  fi
+done
 [ "$ALREADY_ALL" = 1 ] && echo "STATE ALREADY-APPLIED (all $NDIRS drop-ins present and identical; nothing written, nothing restarted)"
 [ "$DRY" = 1 ] && exit 0
+
+# --- apply the cPanel bundled-PHP edit (backup, validate, restore on any problem) -----
+RELOAD_FAIL=0
+CP_DONE=0
+for f in $CP_TODO; do
+  vd=$(dirname "$(dirname "$f")"); CLI="$vd/bin/php"; FPMB="$vd/sbin/php-fpm"
+  B="$f.bak-php2shell-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$f" "$B" || { echo "RELOAD-FAILED cannot back up $f"; RELOAD_FAIL=1; continue; }
+  if [ "$ROLLBACK" = 1 ]; then
+    sed -i '/^; php2shell interim mitigation/,+2d' "$f" && echo "reverted cPanel bundled php.ini $f"
+  elif grep -q '^; php2shell interim mitigation' "$f"; then
+    echo "(cPanel bundled php.ini already has the edit: $f)"
+  else
+    if grep -q '^\[Session\]$' "$f"; then
+      sed -i "/^\[Session\]\$/a $CP_MARK\nsession.upload_progress.enabled = Off\nsession.use_strict_mode = On" "$f"
+    else
+      printf '\n[Session]\n%s\nsession.upload_progress.enabled = Off\nsession.use_strict_mode = On\n' "$CP_MARK" >> "$f"
+    fi
+    echo "edited cPanel bundled php.ini $f (backup $B)"
+  fi
+  bad=0
+  if [ -x "$CLI" ]; then o=$("$CLI" -v 2>&1 </dev/null); echo "$o" | grep -qiE 'warning|error|parse' && bad=1; fi
+  if [ "$bad" = 0 ] && [ -x "$FPMB" ] && [ -f /usr/local/cpanel/etc/php-fpm.conf ]; then
+    "$FPMB" -t -y /usr/local/cpanel/etc/php-fpm.conf > /tmp/.p2s-cpt.$$ 2>&1
+    grep -q 'test is successful' /tmp/.p2s-cpt.$$ || bad=1; rm -f /tmp/.p2s-cpt.$$
+  fi
+  if [ "$bad" = 1 ]; then cp -p "$B" "$f"; echo "RELOAD-FAILED cPanel bundled php.ini failed validation -> restored $f"; RELOAD_FAIL=1; continue; fi
+  CP_DONE=1
+done
+if [ "$CP_DONE" = 1 ]; then
+  if [ -x /usr/local/cpanel/bin/install_php_inis ]; then /usr/local/cpanel/bin/install_php_inis >/dev/null 2>&1 && echo "ran install_php_inis" || echo "NOTE install_php_inis returned an error"; fi
+  if [ "$NORESTART" = 0 ]; then
+    P=$(ps -eo pid,args | grep '[c]panel/etc/php-fpm.conf' | awk '{print $1}' | head -1)
+    if [ -n "$P" ]; then
+      kill -USR2 "$P" && echo "graceful reload sent to cpanel_php_fpm"
+      ok=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 2; np=$(cat /var/run/cpanel_php_fpm.pid 2>/dev/null); [ -n "$np" ] && kill -0 "$np" 2>/dev/null && ok=1 && break; done
+      if [ "$ok" = 1 ]; then echo "BACK-UP cpanel_php_fpm"; else echo "NOT-BACK cpanel_php_fpm"; RELOAD_FAIL=1; fi
+    fi
+  fi
+fi
 
 # --- reload PHP services so running workers pick up the new settings -----------
 # PHP reads ini files only when a process starts, so already-running workers keep
@@ -180,7 +244,6 @@ done
 running() { ps -e -o comm= 2>/dev/null | grep -qx "$1"; }
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 VERB=reload; [ "$HARD" = 1 ] && VERB=restart
-RELOAD_FAIL=0
 RELOADED=""        # every service we touched; checked again below
 svc_do() {
   n="$1"; RELOADED="$RELOADED $n"
@@ -233,7 +296,7 @@ echo "--- effective settings ---"
 for b in /opt/cpanel/ea-php*/root/usr/sbin/php-fpm /opt/alt/php*/usr/bin/php /usr/local/php*/sbin/php-fpm /usr/local/php*/bin/php \
          /opt/plesk/php/*/sbin/php-fpm /opt/plesk/php/*/bin/php /opt/rh/*/root/usr/sbin/php-fpm \
          /usr/sbin/php-fpm* /usr/sbin/php5-fpm /opt/remi/php*/root/usr/sbin/php-fpm /usr/local/lsws/lsphp*/bin/php \
-         /usr/local/sbin/php-fpm /usr/bin/php /usr/local/bin/php; do
+         /usr/local/sbin/php-fpm /usr/local/cpanel/3rdparty/php/*/sbin/php-fpm /usr/local/cpanel/3rdparty/php/*/bin/php /usr/bin/php /usr/local/bin/php; do
   [ -x "$b" ] || continue
   [ "$(head -c4 "$b" 2>/dev/null | tr -d '\000')" = "$(printf '\177ELF')" ] || { echo "SKIP $b (wrapper script, not a PHP binary)"; continue; }
   i=$("$b" -i 2>/dev/null)
