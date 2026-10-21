@@ -85,6 +85,17 @@ is_http_vs() {  # true if any profile on the virtual is an HTTP profile
   done; return 1
 }
 
+
+# Build the "rules ..." clause for a virtual server WITHOUT our rule, keeping the others in order.
+# (tmsh here rejects `rules add` / `rules delete`, so the whole list is always set.)
+rules_clause_without() {
+  local vs="$1" cur list
+  cur=$(r "tmsh list ltm virtual $vs rules 2>/dev/null" | tr -s ' \n' ' ' | sed -E 's/^.*[[:space:]]rules[[:space:]]+//')
+  if echo "$cur" | grep -q '^none'; then echo "rules none"; return; fi
+  list=$(echo "$cur" | sed -E 's/^\{[[:space:]]*//; s/[[:space:]]*\}[[:space:]]*\}[[:space:]]*$//; s/[[:space:]]*\}[[:space:]]*$//')
+  list=$(echo " $list " | sed -E "s/ $RULE / /g; s/^ +//; s/ +$//")
+  if [ -z "$list" ]; then echo "rules none"; else echo "rules { $list }"; fi
+}
 # Build the rule definition (tmsh config-file format) with the requested mode/limits.
 build_conf() {  # $1 = enforce 0/1, $2 = block_chunked 0/1
   [ -f "$IRULE_FILE" ] || die "iRule file not found: $IRULE_FILE"
@@ -141,13 +152,24 @@ case "$ACTION" in
     r "tmsh list ltm virtual $ARG >/dev/null 2>&1" || die "virtual server not found: $ARG"
     if ! is_http_vs "$ARG"; then [ "$FORCE" = 1 ] || die "$ARG has no HTTP profile; the rule needs one (use --force to try anyway)"; fi
     echo "  current rules on $ARG: $(r "tmsh list ltm virtual $ARG rules 2>/dev/null | tr -s ' \\n' ' '")"
-    do_r "attach $RULE to $ARG" "tmsh modify ltm virtual $ARG rules add { $RULE } && tmsh save sys config"
+    # an empty list ("rules none") cannot take `add`; set it directly in that case
+    # tmsh here does not accept `rules add`; set the whole list instead: existing rules in their order, ours last
+    CUR=$(r "tmsh list ltm virtual $ARG rules 2>/dev/null" | tr -s ' \n' ' ' | sed -E 's/^.*[[:space:]]rules[[:space:]]+//')
+    if echo "$CUR" | grep -q '^none'; then RMOD="rules { $RULE }"
+    else
+      LIST=$(echo "$CUR" | sed -E 's/^\{[[:space:]]*//; s/[[:space:]]*\}[[:space:]]*\}[[:space:]]*$//; s/[[:space:]]*\}[[:space:]]*$//')
+      case " $LIST " in *" $RULE "*) echo "  already attached to $ARG - nothing to do"; sync_state; exit 0;; esac
+      RMOD="rules { $LIST $RULE }"
+    fi
+    echo "  new rule list: $RMOD"
+    do_r "attach $RULE to $ARG ($RMOD)" "tmsh modify ltm virtual $ARG $RMOD && tmsh save sys config"
     echo "  mode now: enforce=$(current_flag p2s_enforce). Watch: $0 $F5_HOST logs   |   Undo: $0 $F5_HOST detach $ARG --yes"
     sync_state ;;
   detach)
     [ -n "$ARG" ] || die "usage: detach <virtual-server>"
     need_active
-    do_r "detach $RULE from $ARG" "tmsh modify ltm virtual $ARG rules delete { $RULE } && tmsh save sys config"
+    RMOD=$(rules_clause_without "$ARG"); echo "  new rule list: $RMOD"
+    do_r "detach $RULE from $ARG ($RMOD)" "tmsh modify ltm virtual $ARG $RMOD && tmsh save sys config"
     sync_state ;;
   log-only|enforce)
     need_active
@@ -165,7 +187,7 @@ case "$ACTION" in
   uninstall)
     need_active
     for v in $(r "tmsh list ltm virtual one-line 2>/dev/null | grep -F ' $RULE ' | awk '{print \$3}'"); do
-      do_r "detach from $v" "tmsh modify ltm virtual $v rules delete { $RULE }"
+      RMOD=$(rules_clause_without "$v"); do_r "detach from $v ($RMOD)" "tmsh modify ltm virtual $v $RMOD"
     done
     do_r "delete rule $RULE" "tmsh delete ltm rule $RULE"
     do_r "delete data group $DG" "tmsh delete ltm data-group internal $DG"

@@ -87,6 +87,9 @@ when HTTP_REQUEST {
         }
         set p2s_collect $static::p2s_scan_bytes
         if { $p2s_cap < $p2s_collect } { set p2s_collect $p2s_cap }
+        if { $p2s_cl eq "0" } { return }   ;# empty body: nothing to inspect, and nothing to collect
+        # never ask for more than the body holds: collecting more than Content-Length makes the event wait for a timeout (~1 s on every POST)
+        if { [regexp {^[0-9]{1,9}$} $p2s_cl] && $p2s_cl > 0 && $p2s_cl < $p2s_collect } { set p2s_collect $p2s_cl }
     }
 
     regexp -nocase {boundary=\"?([^\";,[:space:]]+)} $p2s_ct -> p2s_boundary
