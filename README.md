@@ -37,7 +37,7 @@ home directories.
 | `--dry-run` | Show what would be written. Changes nothing, restarts nothing. |
 | `--no-restart` | Write the files only; reload things yourself later. |
 | `--hard-restart` | `restart` instead of `reload` (brief downtime). |
-| `--restart-lsws` | Also restart LiteSpeed (off by default, see below). |
+| `--restart-lsws` | Also hard-restart the LiteSpeed server (rarely needed; see LiteSpeed below). |
 | `--force` | Re-write and re-reload even if already applied. |
 | `--rollback` | Remove the drop-ins this script wrote and reload. |
 | `--user NAME` | SSH user (default `root`). |
@@ -71,6 +71,8 @@ missing one), the script creates it, but only under a known PHP prefix.
 | `*** UNPROTECTED ... ***` | That binary still has the feature on. Needs attention. |
 | `WARN-no-strict-mode-before-5.5.2` | That PHP is too old to have the setting. |
 | `HEALTH OK` / `HEALTH PROBLEM:...` | Service set, PHP-FPM master count and HTTP status before vs after. |
+| `lsphp workers marked for restart` | LiteSpeed was asked to recycle its `lsphp` workers. |
+| `NOTE extra scan dir ...` | A PHP binary reads a scan directory outside the built-in list; it was included. |
 | `NO_PHP_INI_DIR_FOUND` | No PHP scan directory found; nothing was changed. |
 
 ## Limitations — please read
@@ -85,14 +87,26 @@ missing one), the script creates it, but only under a known PHP prefix.
 * **Login loops:** `use_strict_mode` can break legacy apps that invent their own
   session IDs. Per-site fix: `session.use_strict_mode = 0` in that site's `.user.ini`.
   Test a real login after rolling out.
-* **LiteSpeed:** `lsphp` workers keep the old settings until LiteSpeed restarts or the
-  workers are replaced. The script reports this and does **not** restart LiteSpeed unless
-  you pass `--restart-lsws` (a restart re-checks the licence, which matters on
-  IP-locked licences).
+* **LiteSpeed:** `lsphp` workers keep the old settings until they are replaced. On
+  LiteSpeed hosts the script recycles them by touching
+  `/usr/local/lsws/admin/tmp/.lsphp_restart.txt`, LiteSpeed's own trigger. This avoids
+  restarting the web server and re-checking its licence (which matters on IP-locked
+  licences). It runs by default whenever PHP is reloaded; `--restart-lsws` additionally
+  restarts the server. Workers busy with a request should finish it first. Check the
+  `BIN` lines or probe a site afterwards.
 * **Pools that can't be reloaded:** if a PHP-FPM pool's own configuration is broken, a
   reload is refused and that pool keeps its old settings. The script reports
   `RELOAD-FAILED`; do **not** hard-restart such a pool without fixing its config first.
 * **Not a patch:** upgrade PHP as soon as a fixed release is available for your branch.
+
+## Exit status
+
+* `0` — all good (or already applied / dry run).
+* `1` — a human must look: an unprotected PHP binary, `HEALTH PROBLEM`, or a failed reload / lsphp recycle.
+* `2` — no PHP scan directory found (nothing changed).
+* anything else comes from `ssh` itself (e.g. `255` = connection failed).
+
+This makes it safe to drive from a loop: stop on the first non-zero code.
 
 ## Suggested rollout
 

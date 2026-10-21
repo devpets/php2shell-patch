@@ -25,8 +25,8 @@
 #   --dry-run        Show what would be written. Changes nothing, restarts nothing.
 #   --no-restart     Write the files only; do not reload anything yourself.
 #   --hard-restart   Use `restart` instead of a graceful `reload` (brief downtime).
-#   --restart-lsws   Also (hard) restart LiteSpeed. Off by default, because a
-#                    LiteSpeed restart re-checks its licence; see NOTES below.
+#   --restart-lsws   Also hard-restart the LiteSpeed server itself (re-checks its
+#                    licence). Rarely needed: lsphp is recycled automatically.
 #   --force          Re-write and re-reload even if everything is already applied.
 #   --rollback       Remove the drop-ins this script wrote and reload.
 #   --user NAME      SSH user (default: root).
@@ -38,6 +38,12 @@
 #   SUDO=1     Run the remote part through `sudo -n` (use with --user for hosts
 #              where you log in as a non-root user with passwordless sudo).
 #   LOGDIR     Where per-run logs are written (default: ./php2shell-logs).
+#
+# EXIT STATUS
+#   0  all good (or already applied / dry run).
+#   1  a human must look: an unprotected PHP binary, HEALTH PROBLEM, or a failed
+#      reload / lsphp recycle.  2  no PHP scan directory found (nothing changed).
+#   Other non-zero values come from ssh itself (e.g. 255 = connection failed).
 #
 # PLATFORMS DETECTED (drop-in locations)
 #   cPanel/EasyApache, CloudLinux alt-php, DirectAdmin CustomBuild, Plesk,
@@ -57,8 +63,10 @@
 #   * session.use_strict_mode can cause login loops in legacy apps that invent
 #     their own session IDs. Fix per site: session.use_strict_mode=0 in its
 #     .user.ini. Test a real login after rolling out.
-#   * LiteSpeed lsphp workers keep the old settings until LiteSpeed restarts or
-#     the workers are recycled. The script reports this instead of restarting.
+#   * LiteSpeed: lsphp workers are recycled by touching
+#     <lsws>/admin/tmp/.lsphp_restart.txt (no server restart, no licence
+#     re-check). LiteSpeed notices the file within seconds; workers busy with a
+#     request should finish it first. Confirm with the BIN lines / a live check.
 #
 # NOTES
 #   * Idempotent: re-running on an already-patched host prints
@@ -67,7 +75,7 @@
 #   * Provided as-is, with no warranty. You are responsible for testing it in
 #     your environment.
 # =============================================================================
-set -u
+set -u -o pipefail
 
 # --- argument parsing --------------------------------------------------------
 HOST="${1:-}"; [ -n "$HOST" ] || { sed -n '2,3p;22,40p' "$0"; exit 1; }; shift
@@ -91,6 +99,7 @@ LOG="$LOGDIR/patch-$HOST-$(date +%Y%m%d-%H%M%S).log"
 # shellcheck disable=SC2086
 ssh -o BatchMode=yes -o ConnectTimeout=15 ${SSH_OPTS:-} "$USER_@$HOST" "${SUDO:+sudo -n }env DRY=$DRY NORESTART=$NORESTART LSWS=$LSWS ROLLBACK=$ROLLBACK HARD=$HARD FORCE=$FORCE bash -s" <<'REMOTE' 2>&1 | tee "$LOG"
 set -u
+RC=0   # remote exit status: 1 = a human must look at this host
 
 # The drop-in content. Compared byte-for-byte later to detect "already applied".
 INI='; php2shell interim mitigation 2026-10-21 (CVE-2026-109618/109619) - keep after patching
@@ -136,7 +145,7 @@ for b in /opt/cpanel/ea-php*/root/usr/bin/php /opt/alt/php*/usr/bin/php /usr/loc
   [ -x "$b" ] || continue
   sd=$("$b" --ini 2>/dev/null | sed -n 's/^Scan for additional .ini files in: *//p' | head -1)
   case "$sd" in ""|"(none)") continue;; esac
-  [ -d "$sd" ] && continue
+  if [ -d "$sd" ]; then case " $DIRS " in *" $sd "*) ;; *) DIRS="$DIRS $sd"; echo "NOTE extra scan dir from $b: $sd";; esac; continue; fi
   case " $DIRS $NEWDIRS " in *" $sd "*) continue;; esac
   case "$sd" in /usr/local/php*|/opt/cpanel/*|/opt/alt/*|/opt/plesk/*|/opt/remi/*|/etc/opt/remi/*|/etc/php*|/usr/local/lsws/*|/usr/local/lib/*|/usr/local/etc/php*) ;; *) echo "SKIP scan dir outside known prefixes: $sd ($b)"; continue;; esac
   [ -d "$(dirname "$sd")" ] || { echo "SKIP scan dir parent missing: $sd ($b)"; continue; }
@@ -195,9 +204,11 @@ if [ "$NORESTART" = 0 ] && [ "$ALREADY_ALL" = 0 ]; then
   for s in $(fpm_services); do svc_do "$s"; done
   running apache2 && web_graceful apache2
   running httpd   && web_graceful httpd
-  if [ "$LSWS" = 1 ]; then
-    for s in lsws litespeed lshttpd; do { have_systemd && systemctl cat "$s" >/dev/null 2>&1; } || [ -x "/etc/init.d/$s" ] && { VERB=restart; svc_do "$s"; break; }; done
-  elif [ -d /usr/local/lsws ]; then echo "NOTE LiteSpeed NOT restarted: lsphp keeps old settings until restart (rerun with --restart-lsws)"; fi
+  if [ -d /usr/local/lsws ]; then
+    # LiteSpeed-documented way to recycle every lsphp process without restarting the web server (no licence re-check)
+    if touch /usr/local/lsws/admin/tmp/.lsphp_restart.txt 2>/dev/null; then echo "lsphp workers marked for restart (.lsphp_restart.txt)"; else echo "RELOAD-FAILED lsphp (could not touch .lsphp_restart.txt)"; RELOAD_FAIL=1; fi
+    if [ "$LSWS" = 1 ]; then for s in lsws litespeed lshttpd; do { have_systemd && systemctl cat "$s" >/dev/null 2>&1; } || [ -x "/etc/init.d/$s" ] && { VERB=restart; svc_do "$s"; break; }; done; fi
+  fi
   sleep 3
 fi
 
@@ -240,6 +251,7 @@ for b in /opt/cpanel/ea-php*/root/usr/sbin/php-fpm /opt/alt/php*/usr/bin/php /us
     case "$up" in Off|off|0) ;; *) w="$w *** UNPROTECTED-upload_progress-still-on ***";; esac
     case "$sm" in On|on|1) ;; *) case "$w" in *WARN-no-strict*) ;; *) w="$w *** strict_mode-not-on ***";; esac;; esac
   fi
+  case "$w" in *'***'*) RC=1;; esac
   echo "BIN $b php=${ver:-?} upload_progress=${up:-?} strict_mode=${sm:-?}$w"
 done
 echo "WORKERS fpm_masters=$(ps -eo args | grep -c '[p]hp-fpm: master') httpd=$(ps -e -o comm= | grep -cx httpd) apache2=$(ps -e -o comm= | grep -cx apache2) lsphp=$(ps -e -o comm= | grep -c lsphp)"
@@ -253,8 +265,11 @@ if [ "$DRY" = 0 ]; then
   [ "$M_A" -lt "$M_B" ] && prob="$prob fpm-masters:$M_B->$M_A"
   [ "$H_B" != "$H_A" ] && prob="$prob http:$H_B->$H_A"
   [ "$RELOAD_FAIL" = 1 ] && prob="$prob reload-failed"
-  if [ -z "$prob" ]; then echo "HEALTH OK services=$(echo "$SVC_A" | grep -c .) fpm_masters=$M_A http=$H_A (same as before)"; else echo "HEALTH PROBLEM:$prob"; fi
+  if [ -z "$prob" ]; then echo "HEALTH OK services=$(echo "$SVC_A" | grep -c .) fpm_masters=$M_A http=$H_A (same as before)"; else echo "HEALTH PROBLEM:$prob"; RC=1; fi
 fi
 echo "RESULT done. Login loop on a legacy site => session.use_strict_mode=0 in that site's .user.ini"
+exit $RC
 REMOTE
-echo "log: $LOG"
+rc=$?
+echo "log: $LOG (exit $rc)"
+exit $rc
