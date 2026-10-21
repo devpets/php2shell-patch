@@ -105,3 +105,7 @@ missing one), the script creates it, but only under a known PHP prefix.
 
 `./php2shell-patch.sh <host|ip> --rollback` deletes only the `zz-php2shell.ini` files
 this script wrote and reloads the services.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
